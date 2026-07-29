@@ -1,6 +1,6 @@
 [package]
 name = "blazingly-wire"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Framework-independent HTTP/1 parsing, framing, and response encoding built only on httparse"
@@ -10,8 +10,6 @@ repository = "https://github.com/sergii-ziborov/blazingly-wire"
 documentation = "https://docs.rs/blazingly-wire"
 keywords = ["http", "http1", "parser", "sans-io", "protocol"]
 categories = ["network-programming", "parser-implementations", "web-programming"]
-# Flipped once the crate has a tagged release and a cargo-semver-checks baseline.
-publish = false
 
 [dependencies]
 httparse = "1.10"

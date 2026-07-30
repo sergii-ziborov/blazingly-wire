@@ -7,7 +7,7 @@
 //! choose how reads, writes, scheduling, and application dispatch happen.
 
 use std::fmt;
-use std::io::{self, Write as _};
+use std::io;
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -155,33 +155,41 @@ pub struct HeaderPosition {
     pub value: ByteRange,
 }
 
+const EMPTY_HEADER_POSITION: HeaderPosition = HeaderPosition {
+    name: ByteRange { start: 0, end: 0 },
+    value: ByteRange { start: 0, end: 0 },
+};
+
 /// Inline-first header positions parsed without copying header bytes.
 #[derive(Clone, Debug)]
 pub struct HeaderPositions {
-    inline: [Option<HeaderPosition>; INLINE_REQUEST_HEADERS],
+    inline: [HeaderPosition; INLINE_REQUEST_HEADERS],
+    inline_len: usize,
     overflow: Vec<HeaderPosition>,
 }
 
 impl HeaderPositions {
     fn new() -> Self {
         Self {
-            inline: [None; INLINE_REQUEST_HEADERS],
+            inline: [EMPTY_HEADER_POSITION; INLINE_REQUEST_HEADERS],
+            inline_len: 0,
             overflow: Vec::new(),
         }
     }
 
     fn push(&mut self, header: HeaderPosition) {
-        if let Some(slot) = self.inline.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(header);
+        if self.inline_len < INLINE_REQUEST_HEADERS {
+            self.inline[self.inline_len] = header;
+            self.inline_len += 1;
         } else {
             self.overflow.push(header);
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = HeaderPosition> + '_ {
-        self.inline
+        self.inline[..self.inline_len]
             .iter()
-            .filter_map(|header| *header)
+            .copied()
             .chain(self.overflow.iter().copied())
     }
 
@@ -318,45 +326,66 @@ fn parse_head_with_headers<'buffer>(
     let mut content_length = None;
     let mut connection_close = false;
     let mut connection_keep_alive = false;
-    let mut transfer_encodings = Vec::new();
+    let mut transfer_encoding_tokens = 0_usize;
+    let mut transfer_encoding_chunked = false;
     let mut parsed_headers = HeaderPositions::new();
     for header in request.headers.iter() {
         parsed_headers.push(HeaderPosition {
             name: byte_range(buffer, header.name.as_bytes())?,
             value: byte_range(buffer, header.value)?,
         });
-        let value = std::str::from_utf8(header.value).map_err(|_| ParseError::bad_request())?;
-        if header.name.eq_ignore_ascii_case("content-length") {
-            let length = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| ParseError::bad_request())?;
-            if content_length.is_some_and(|previous| previous != length) {
-                return Err(ParseError::bad_request());
+        // Length gate before case-insensitive comparison; values of framing
+        // headers stay fully validated, other values are validated lazily on
+        // lookup.
+        match header.name.len() {
+            14 if header.name.eq_ignore_ascii_case("content-length") => {
+                let length = parse_content_length(header.value)?;
+                if content_length.is_some_and(|previous| previous != length) {
+                    return Err(ParseError::bad_request());
+                }
+                content_length = Some(length);
             }
-            content_length = Some(length);
-        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-            transfer_encodings.extend(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|token| !token.is_empty())
-                    .map(str::to_ascii_lowercase),
-            );
-        } else if header.name.eq_ignore_ascii_case("connection") {
-            for token in value.split(',').map(str::trim) {
-                connection_close |= token.eq_ignore_ascii_case("close");
-                connection_keep_alive |= token.eq_ignore_ascii_case("keep-alive");
+            17 if header.name.eq_ignore_ascii_case("transfer-encoding") => {
+                if header.value.eq_ignore_ascii_case(b"chunked") {
+                    transfer_encoding_tokens += 1;
+                    transfer_encoding_chunked = transfer_encoding_tokens == 1;
+                } else {
+                    let value =
+                        std::str::from_utf8(header.value).map_err(|_| ParseError::bad_request())?;
+                    for token in value.split(',').map(str::trim) {
+                        if token.is_empty() {
+                            continue;
+                        }
+                        transfer_encoding_tokens += 1;
+                        transfer_encoding_chunked =
+                            transfer_encoding_tokens == 1 && token.eq_ignore_ascii_case("chunked");
+                    }
+                }
             }
+            10 if header.name.eq_ignore_ascii_case("connection") => {
+                if header.value.eq_ignore_ascii_case(b"keep-alive") {
+                    connection_keep_alive = true;
+                } else if header.value.eq_ignore_ascii_case(b"close") {
+                    connection_close = true;
+                } else {
+                    let value =
+                        std::str::from_utf8(header.value).map_err(|_| ParseError::bad_request())?;
+                    for token in value.split(',').map(str::trim) {
+                        connection_close |= token.eq_ignore_ascii_case("close");
+                        connection_keep_alive |= token.eq_ignore_ascii_case("keep-alive");
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    if !transfer_encodings.is_empty() && content_length.is_some() {
+    if transfer_encoding_tokens > 0 && content_length.is_some() {
         return Err(ParseError::bad_request());
     }
-    let body = if transfer_encodings.is_empty() {
+    let body = if transfer_encoding_tokens == 0 {
         BodyFraming::ContentLength(content_length.unwrap_or(0))
-    } else if transfer_encodings.len() == 1 && transfer_encodings[0] == "chunked" {
+    } else if transfer_encoding_chunked {
         BodyFraming::Chunked
     } else {
         return Err(ParseError {
@@ -659,8 +688,7 @@ pub struct DecodedChunkedBody {
 ///
 /// # Errors
 ///
-/// Returns an invalid-input error for unsafe header names/values or an
-/// impossible output formatting failure.
+/// Returns an invalid-input error for unsafe header names, values, or date.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_response_head<'headers>(
     output: &mut Vec<u8>,
@@ -671,13 +699,10 @@ pub fn encode_response_head<'headers>(
     keep_alive: bool,
     date: &str,
 ) -> io::Result<()> {
-    write!(output, "HTTP/1.1 {status} {}\r\n", reason_phrase(status))?;
+    push_status_line(output, status);
     let mut has_date = false;
     for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-            || name.eq_ignore_ascii_case("connection")
-        {
+        if is_framing_header(name) {
             continue;
         }
         if !valid_header(name, value) {
@@ -686,11 +711,112 @@ pub fn encode_response_head<'headers>(
                 "response contains an invalid header",
             ));
         }
-        has_date |= name.eq_ignore_ascii_case("date");
-        write!(output, "{name}: {value}\r\n")?;
+        has_date |= name.len() == 4 && name.eq_ignore_ascii_case("date");
+        push_header(output, name, value);
     }
+    push_framing_tail(output, content_length, chunked, keep_alive, date, has_date)
+}
+
+/// Response headers validated and encoded once for reuse across responses.
+///
+/// [`encode_response_head`] re-validates every header on every call, which is
+/// the right default for uncontrolled input. When the same header set is sent
+/// many times, prepare it once and encode each response with
+/// [`encode_response_head_prepared`].
+#[derive(Clone, Debug)]
+pub struct PreparedHeaders {
+    encoded: Vec<u8>,
+    has_date: bool,
+}
+
+impl PreparedHeaders {
+    /// Validates response headers once, filtering caller-supplied framing
+    /// fields exactly like [`encode_response_head`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for unsafe header names/values.
+    pub fn new<'headers>(
+        headers: impl IntoIterator<Item = (&'headers str, &'headers str)>,
+    ) -> io::Result<Self> {
+        let mut encoded = Vec::new();
+        let mut has_date = false;
+        for (name, value) in headers {
+            if is_framing_header(name) {
+                continue;
+            }
+            if !valid_header(name, value) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "response contains an invalid header",
+                ));
+            }
+            has_date |= name.len() == 4 && name.eq_ignore_ascii_case("date");
+            push_header(&mut encoded, name, value);
+        }
+        Ok(Self { encoded, has_date })
+    }
+}
+
+/// Encodes an HTTP/1 response head from pre-validated headers.
+///
+/// Framing behavior matches [`encode_response_head`]; per-header validation
+/// was already paid once in [`PreparedHeaders::new`].
+///
+/// # Errors
+///
+/// Returns an invalid-input error for an unsafe `date` value.
+pub fn encode_response_head_prepared(
+    output: &mut Vec<u8>,
+    status: u16,
+    headers: &PreparedHeaders,
+    content_length: Option<u64>,
+    chunked: bool,
+    keep_alive: bool,
+    date: &str,
+) -> io::Result<()> {
+    push_status_line(output, status);
+    output.extend_from_slice(&headers.encoded);
+    push_framing_tail(
+        output,
+        content_length,
+        chunked,
+        keep_alive,
+        date,
+        headers.has_date,
+    )
+}
+
+fn push_status_line(output: &mut Vec<u8>, status: u16) {
+    let reason = reason_phrase(status).as_bytes();
+    let mut digits = [0_u8; 20];
+    let start = write_decimal(u64::from(status), &mut digits);
+    let count = digits.len() - start;
+    // Longest reason phrase is 31 bytes; 64 leaves headroom for new phrases.
+    let mut line = [0_u8; 64];
+    line[..9].copy_from_slice(b"HTTP/1.1 ");
+    let mut cursor = 9;
+    line[cursor..cursor + count].copy_from_slice(&digits[start..]);
+    cursor += count;
+    line[cursor] = b' ';
+    cursor += 1;
+    line[cursor..cursor + reason.len()].copy_from_slice(reason);
+    cursor += reason.len();
+    line[cursor] = b'\r';
+    line[cursor + 1] = b'\n';
+    output.extend_from_slice(&line[..cursor + 2]);
+}
+
+fn push_framing_tail(
+    output: &mut Vec<u8>,
+    content_length: Option<u64>,
+    chunked: bool,
+    keep_alive: bool,
+    date: &str,
+    has_date: bool,
+) -> io::Result<()> {
     if let Some(length) = content_length {
-        write!(output, "content-length: {length}\r\n")?;
+        push_content_length_line(output, length);
     } else if chunked {
         output.extend_from_slice(b"transfer-encoding: chunked\r\n");
     }
@@ -701,13 +827,99 @@ pub fn encode_response_head<'headers>(
                 "response date is invalid",
             ));
         }
-        write!(output, "date: {date}\r\n")?;
+        push_date_line(output, date);
     }
     if !keep_alive {
         output.extend_from_slice(b"connection: close\r\n");
     }
     output.extend_from_slice(b"\r\n");
     Ok(())
+}
+
+fn push_date_line(output: &mut Vec<u8>, date: &str) {
+    const PREFIX: &[u8; 6] = b"date: ";
+    let date = date.as_bytes();
+    let mut line = [0_u8; 64];
+    if date.len() <= line.len() - PREFIX.len() - 2 {
+        let mut cursor = append(&mut line, 0, PREFIX);
+        cursor = append(&mut line, cursor, date);
+        cursor = append(&mut line, cursor, b"\r\n");
+        output.extend_from_slice(&line[..cursor]);
+    } else {
+        output.extend_from_slice(PREFIX);
+        output.extend_from_slice(date);
+        output.extend_from_slice(b"\r\n");
+    }
+}
+
+fn is_framing_header(name: &str) -> bool {
+    match name.len() {
+        10 => name.eq_ignore_ascii_case("connection"),
+        14 => name.eq_ignore_ascii_case("content-length"),
+        17 => name.eq_ignore_ascii_case("transfer-encoding"),
+        _ => false,
+    }
+}
+
+fn push_header(output: &mut Vec<u8>, name: &str, value: &str) {
+    output.extend_from_slice(name.as_bytes());
+    output.extend_from_slice(b": ");
+    output.extend_from_slice(value.as_bytes());
+    output.extend_from_slice(b"\r\n");
+}
+
+fn append<const CAPACITY: usize>(
+    buffer: &mut [u8; CAPACITY],
+    cursor: usize,
+    bytes: &[u8],
+) -> usize {
+    buffer[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+    cursor + bytes.len()
+}
+
+/// Writes `value` right-aligned into `digits`; returns the first used index.
+fn write_decimal(mut value: u64, digits: &mut [u8; 20]) -> usize {
+    let mut cursor = digits.len();
+    loop {
+        cursor -= 1;
+        #[allow(clippy::cast_possible_truncation)] // remainder < 10
+        {
+            digits[cursor] = b'0' + (value % 10) as u8;
+        }
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    cursor
+}
+
+fn push_content_length_line(output: &mut Vec<u8>, length: u64) {
+    const PREFIX: &[u8; 16] = b"content-length: ";
+    let mut digits = [0_u8; 20];
+    let start = write_decimal(length, &mut digits);
+    let count = digits.len() - start;
+    let mut line = [0_u8; PREFIX.len() + 20 + 2];
+    line[..PREFIX.len()].copy_from_slice(PREFIX);
+    line[PREFIX.len()..PREFIX.len() + count].copy_from_slice(&digits[start..]);
+    line[PREFIX.len() + count] = b'\r';
+    line[PREFIX.len() + count + 1] = b'\n';
+    output.extend_from_slice(&line[..PREFIX.len() + count + 2]);
+}
+
+fn push_hex(output: &mut Vec<u8>, mut value: usize) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut digits = [0_u8; usize::BITS as usize / 4];
+    let mut cursor = digits.len();
+    loop {
+        cursor -= 1;
+        digits[cursor] = HEX[value & 0xF];
+        value >>= 4;
+        if value == 0 {
+            break;
+        }
+    }
+    output.extend_from_slice(&digits[cursor..]);
 }
 
 /// Encodes a `101 Switching Protocols` response without HTTP body framing.
@@ -745,7 +957,7 @@ pub fn encode_upgrade_response<'headers>(
         }
         has_upgrade |= name.eq_ignore_ascii_case("upgrade") && !value.trim().is_empty();
         has_date |= name.eq_ignore_ascii_case("date");
-        write!(output, "{name}: {value}\r\n")?;
+        push_header(output, name, value);
     }
     if !has_connection_upgrade || !has_upgrade {
         return Err(io::Error::new(
@@ -760,7 +972,7 @@ pub fn encode_upgrade_response<'headers>(
                 "response date is invalid",
             ));
         }
-        write!(output, "date: {date}\r\n")?;
+        push_header(output, "date", date);
     }
     output.extend_from_slice(b"\r\n");
     Ok(())
@@ -770,10 +982,10 @@ pub fn encode_upgrade_response<'headers>(
 ///
 /// # Errors
 ///
-/// Returns an error if formatting the chunk length into the output buffer
-/// fails.
+/// Never fails today; the `io::Result` return is kept for API stability.
 pub fn encode_chunk(output: &mut Vec<u8>, chunk: &[u8]) -> io::Result<()> {
-    write!(output, "{:X}\r\n", chunk.len())?;
+    push_hex(output, chunk.len());
+    output.extend_from_slice(b"\r\n");
     output.extend_from_slice(chunk);
     output.extend_from_slice(b"\r\n");
     Ok(())
@@ -820,6 +1032,22 @@ fn byte_range(buffer: &[u8], slice: &[u8]) -> Result<ByteRange, ParseError> {
     Ok(ByteRange { start, end })
 }
 
+fn parse_content_length(value: &[u8]) -> Result<usize, ParseError> {
+    // Digits-only fast path; whitespace-padded values take the tolerant path.
+    if !value.is_empty() && value.len() <= 19 && value.iter().all(u8::is_ascii_digit) {
+        let mut length = 0_u64;
+        for &byte in value {
+            length = length * 10 + u64::from(byte - b'0');
+        }
+        return usize::try_from(length).map_err(|_| ParseError::bad_request());
+    }
+    std::str::from_utf8(value)
+        .map_err(|_| ParseError::bad_request())?
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ParseError::bad_request())
+}
+
 fn validate_trailers(trailers: &[u8]) -> Result<(), ParseError> {
     let trailers = std::str::from_utf8(trailers).map_err(|_| ParseError::bad_request())?;
     for line in trailers.split("\r\n") {
@@ -839,14 +1067,47 @@ fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|position| from + position)
 }
 
+static HEADER_NAME_BYTES: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut index = 0_usize;
+    while index < 256 {
+        #[allow(clippy::cast_possible_truncation)] // index < 256
+        {
+            table[index] = is_header_name_byte(index as u8);
+        }
+        index += 1;
+    }
+    table
+};
+
 fn valid_header(name: &str, value: &str) -> bool {
-    !name.is_empty() && name.bytes().all(is_header_name_byte) && valid_header_value(value)
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| HEADER_NAME_BYTES[usize::from(byte)])
+        && valid_header_value(value)
 }
 
+/// Word-at-a-time scan flagging bytes below 0x20 (except HTAB) and DEL.
 fn valid_header_value(value: &str) -> bool {
-    !value
-        .bytes()
-        .any(|byte| byte != b'\t' && (byte < b' ' || byte == 127))
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut chunks = value.as_bytes().chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        let below_space = word.wrapping_sub(LOW * 0x20) & !word & HIGH;
+        let tab = word ^ (LOW * u64::from(b'\t'));
+        let tab = tab.wrapping_sub(LOW) & !tab & HIGH;
+        let del = word ^ (LOW * 0x7F);
+        let del = del.wrapping_sub(LOW) & !del & HIGH;
+        if ((below_space & !tab) | del) != 0 {
+            return false;
+        }
+    }
+    chunks
+        .remainder()
+        .iter()
+        .all(|&byte| byte == b'\t' || (byte >= b' ' && byte != 127))
 }
 
 const fn is_header_name_byte(byte: u8) -> bool {
@@ -883,8 +1144,9 @@ fn header_name_matches(header: &str, argument: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyFraming, ChunkDecoder, Limits, Method, StreamingChunk, StreamingChunkDecoder,
-        encode_response_head, encode_upgrade_response, parse_request_head,
+        BodyFraming, ChunkDecoder, Limits, Method, PreparedHeaders, StreamingChunk,
+        StreamingChunkDecoder, encode_chunk, encode_response_head, encode_response_head_prepared,
+        encode_upgrade_response, parse_request_head,
     };
 
     #[test]
@@ -980,6 +1242,96 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_multi_token_transfer_encoding() {
+        let bytes = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let error = parse_request_head(bytes, Limits::new()).expect_err("must reject");
+        assert_eq!(error.status, 501);
+    }
+
+    #[test]
+    fn parses_more_than_inline_headers_via_overflow() {
+        let mut bytes = b"GET / HTTP/1.1\r\n".to_vec();
+        for index in 0..20 {
+            bytes.extend_from_slice(format!("x-h{index}: v{index}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"\r\n");
+        let head = parse_request_head(&bytes, Limits::new().with_max_headers(32))
+            .expect("valid request")
+            .expect("complete head");
+        assert_eq!(head.headers.iter().count(), 20);
+        assert_eq!(head.headers.value(&bytes, "x-h0", 0), Some("v0"));
+        assert_eq!(head.headers.value(&bytes, "x-h19", 0), Some("v19"));
+    }
+
+    #[test]
+    fn prepared_headers_match_the_validating_path_and_stay_filtered() {
+        let headers = [
+            ("content-type", "application/json"),
+            ("content-length", "999"),
+            ("x-request-id", "abc123"),
+        ];
+        let date = "Mon, 27 Jul 2026 00:00:00 GMT";
+        let mut per_call = Vec::new();
+        encode_response_head(&mut per_call, 200, headers, Some(2), false, true, date)
+            .expect("valid response");
+        let prepared = PreparedHeaders::new(headers).expect("valid headers");
+        let mut reused = Vec::new();
+        encode_response_head_prepared(&mut reused, 200, &prepared, Some(2), false, true, date)
+            .expect("valid response");
+        assert_eq!(per_call, reused);
+        assert!(
+            !String::from_utf8(reused)
+                .expect("HTTP text")
+                .contains("999")
+        );
+        assert!(PreparedHeaders::new([("x-bad", "ok\r\ninjected: true")]).is_err());
+    }
+
+    #[test]
+    fn prepared_caller_date_suppresses_the_generated_date() {
+        let prepared =
+            PreparedHeaders::new([("Date", "Mon, 27 Jul 2026 00:00:00 GMT")]).expect("valid");
+        let mut output = Vec::new();
+        encode_response_head_prepared(&mut output, 204, &prepared, None, false, true, "ignored")
+            .expect("valid response");
+        let text = String::from_utf8(output).expect("HTTP text");
+        assert_eq!(text.matches("ate:").count(), 1);
+    }
+
+    #[test]
+    fn value_validation_scans_full_words_and_remainders() {
+        let accepts = |value: &str| {
+            let mut output = Vec::new();
+            encode_response_head(
+                &mut output,
+                200,
+                [("x-v", value)],
+                Some(0),
+                false,
+                true,
+                "Mon, 27 Jul 2026 00:00:00 GMT",
+            )
+            .is_ok()
+        };
+        assert!(accepts("exactly-eight!!!"));
+        assert!(accepts("tab\tinside a longer value"));
+        assert!(accepts("caf\u{e9} obs-text value"));
+        assert!(!accepts("bad\u{7f}in first word"));
+        assert!(!accepts("eightpad\u{7f}tail"));
+        assert!(!accepts("eightpadx\u{1f}"));
+        assert!(!accepts("\u{1}"));
+    }
+
+    #[test]
+    fn encodes_chunk_frames_with_uppercase_hex_sizes() {
+        let mut output = Vec::new();
+        encode_chunk(&mut output, &[b'x'; 26]).expect("chunk frame");
+        assert!(output.starts_with(b"1A\r\n"));
+        assert!(output.ends_with(b"\r\n"));
+        assert_eq!(output.len(), 4 + 26 + 2);
     }
 
     #[test]

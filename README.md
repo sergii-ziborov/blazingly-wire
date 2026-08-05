@@ -55,11 +55,18 @@ curl -i http://127.0.0.1:8080/
 
 `BLAZINGLY_WIRE_ADDRESS` overrides the listen address.
 
+## Install
+
+```toml
+[dependencies]
+blazingly-wire = "0.1"
+```
+
 ## Status
 
-Pre-1.0 and not yet published to crates.io. The wire behaviour is covered by
-unit tests here and by fuzz targets, Miri, and AddressSanitizer jobs in the
-Blazingly repository, which drives this codec against real sockets.
+Pre-1.0, published on crates.io. The wire behaviour is covered by unit tests
+here and by fuzz targets, Miri, and AddressSanitizer jobs in the Blazingly
+repository, which drives this codec against real sockets.
 
 `unsafe_code` is forbidden.
 

@@ -1,6 +1,6 @@
 [package]
 name = "blazingly-wire"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.88"
 description = "Framework-independent HTTP/1 parsing, framing, and response encoding built only on httparse"

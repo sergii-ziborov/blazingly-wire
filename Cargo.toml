@@ -15,11 +15,16 @@ categories = ["network-programming", "parser-implementations", "web-programming"
 httparse = "1.10"
 
 [dev-dependencies]
+criterion = "0.8.2"
 httpdate = "1.0.3"
 
 [[example]]
 name = "standalone_server"
 path = "examples/standalone_server.rs"
+
+[[bench]]
+name = "response_head"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"
